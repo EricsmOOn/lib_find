@@ -9,7 +9,7 @@
 -export([
         files/2
         ,files/3
-        ,files/6
+        ,files/5
         ,find_erl/1
         ,find_hrl/1
     ]).
@@ -37,18 +37,14 @@ files(Dir, Re) ->
 
 -spec files(string(), string(), boolean()) -> [binary()].
 files(Dir, Re, Flag) -> 
-    files(Dir, Re, Flag, true, binary, []).
+    files(Dir, Re, Flag, true, binary).
 
--spec files(string(), string(), boolean(), boolean(), binary | string, [binary()] | [string()]) -> [binary()] | [string()].
-files(Dir, Re, Recursive, FullPath, Type, Acc) ->
+-spec files(string(), string(), boolean(), boolean(), binary | string) -> [binary()] | [string()].
+files(Dir, Re, Recursive, FullPath, Type) ->
     Reg = xmerl_regexp:sh_to_awk(Re),
-    case file:list_dir(Dir) of
-        {ok, Files} ->
-            Result = find_files(Files, Reg, Acc, #{dir => Dir, full_path => FullPath, recursive => Recursive, type => Type}),
-            lists:reverse(Result);
-        {error, E} ->
-            ?I("[LIB_FIND] Error Dir: ~ts Reason: ~w~n",[Dir, E]),
-            Acc
+    files(Dir, Reg, #{recursive => Recursive, full_path => FullPath, type => Type}, []),
+    receive
+        R -> R
     end.
 
 %% @doc 查到对应文件夹(们)下的所有hrl文件
@@ -74,6 +70,22 @@ find_erl(Dir) ->
 %%----------------------------------------------------
 %% 内部私有
 %%----------------------------------------------------
+files(Dir, Reg, Args, Acc) ->
+    Me = self(),
+    case file:list_dir(Dir) of
+        {ok, Files} ->
+            case get(child_num) of
+                N when is_integer(N) ->
+                    put(child_num, N + 1);
+                _ ->
+                    put(child_num, 1)
+            end,
+            erlang:spawn(fun() -> find_files(Files, Reg, Acc, Args#{dir => Dir, master => Me}) end);
+        {error, E} ->
+            ?I("[LIB_FIND] Error Dir: ~ts Reason: ~w~n",[Dir, E]),
+            Acc
+    end.
+
 find_files([File | T], Reg, Acc0, Args = #{dir := Dir, full_path := FullPath, recursive := Recursive, type := Type}) ->
     FullName = filename:join([Dir, File]),
     Name = case FullPath of
@@ -105,16 +117,30 @@ find_files([File | T], Reg, Acc0, Args = #{dir := Dir, full_path := FullPath, re
             ?D("~n[~p:~p] Searching ~ts...~n",[?FILE, ?LINE, FullName]),
             case Recursive of
                 true ->
-                    Acc1 = files(FullName, Reg, Recursive, FullPath, Type, Acc0),
-                    find_files(T, Reg, Acc1, Args);
+                    files(FullName, Reg, Args, Acc0),
+                    find_files(T, Reg, Acc0, Args);
                 _ ->
                     find_files(T, Reg, Acc0, Args)
             end;
         error -> 
             find_files(T, Reg, Acc0, Args)
     end;
-find_files([], _, A, _) ->
-    A.
+find_files([], _, A, #{master := Master}) ->
+    case get(child_num) of
+        N when is_integer(N) ->
+            receive_wait(N, A, Master);
+        _ ->
+            receive_wait(0, A, Master)
+    end.
+
+receive_wait(0, Result, Master) -> 
+    ?D("~w进程及子进程收集结束 结果返回到父进程~w 大小~w~n", [self(), Master, length(Result)]),
+    Master ! Result;
+receive_wait(N, Result, Master) ->
+    receive
+        R ->
+            receive_wait(N - 1, R ++ Result, Master)
+    end.
 
 file_type(File) ->
     case excluded(File) andalso file:read_file_info(File) of
